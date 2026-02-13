@@ -1,0 +1,151 @@
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    pipeline
+)
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel
+from trl import SFTTrainer
+from huggingface_hub import login, HfApi
+from accelerate import Accelerator
+import os
+import json
+import torch
+
+# Initialize Accelerator at the top, right after imports
+accelerator = Accelerator()
+device = accelerator.device
+
+print("Successfully imported required libraries for dataset handling, model configuration, and LoRA fine-tuning.")
+login(token="")
+
+
+try:
+    api = HfApi()
+    user_info = api.whoami()
+    print(f"Token validated successfully! Logged in as: {user_info['name']}")
+except Exception as e:
+    print(f"Token validation failed. Error: {e}")
+
+
+
+# ────────────────── CONFIG ──────────────────
+MODEL_ID   = "meta-llama/Llama-3.3-70B-Instruct"
+DATA_PATH  = "../6_Reasoning_fine_tune_dataset.jsonl"
+OUTPUT_DIR = "./results_lora2"
+
+# ────────────────── 1. TOKENIZER ─────────────
+tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+tok.pad_token = tok.eos_token
+tok.padding_side = "right"
+
+# ────────────────── 2. BASE MODEL ────────────
+base = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    # device_map="auto",  # ✅ Auto-distributes model across available GPUs
+)
+base.config.use_cache = False
+base.config.pretraining_tp = 1
+
+# ────────────────── 3. LORA CONFIG ───────────
+lora_cfg = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+)
+
+model = get_peft_model(base, lora_cfg)
+model.train()
+
+# ────────────────── 4. SANITY CHECK ──────────
+model.print_trainable_parameters()
+assert any(p.requires_grad for p in model.parameters()), "❌ No trainable parameters found!"
+
+# ────────────────── 5. DATA LOADING ──────────
+ds = load_dataset("json", data_files=DATA_PATH, split="train")
+
+def tokenize(example):
+    prompt = tok.apply_chat_template(
+        example["messages"],
+        tokenize=False,
+        add_generation_prompt=False
+    )
+    encoded = tok(
+        prompt,
+        truncation=True,
+        max_length=4096,
+        padding="max_length",
+        return_tensors="pt"
+    )
+    input_ids = encoded["input_ids"].squeeze()
+    attention_mask = encoded["attention_mask"].squeeze()
+    labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels
+    }
+
+train_ds = ds.map(tokenize, remove_columns=["messages"])
+eval_dataset = train_ds.shuffle(seed=42).select(range(500))
+
+collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)
+
+# ─────────── Token Length Diagnostic ─────────
+avg_len = sum(len(x['input_ids']) for x in train_ds) / len(train_ds)
+print(f"🧠 Avg token length in dataset: {avg_len:.2f}")
+
+# ────────────────── 6. TRAINING ARGS ─────────
+args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,
+    num_train_epochs=1,
+    learning_rate=4e-5,
+    bf16=True,
+    save_strategy="steps",
+    save_steps=50,
+    eval_steps=50,
+    logging_dir=f"{OUTPUT_DIR}/logs",
+    logging_steps=10,
+    report_to="tensorboard",
+    remove_unused_columns=False,
+    gradient_checkpointing=False,
+    dataloader_pin_memory=True,
+    dataloader_num_workers=2,
+    warmup_ratio=0.03,
+    lr_scheduler_type="cosine"
+)
+
+# ────────────────── 7. TRAINER SETUP ─────────
+trainer = Trainer(
+    model=model,
+    tokenizer=tok,
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=eval_dataset,
+    data_collator=collator
+)
+
+# ────────────────── 8. TRAIN ─────────────────
+trainer.train()
+
+# ────────────────── 9. SAVE ADAPTER ──────────
+model.eval()
+final_dir = f"{OUTPUT_DIR}/final_adapter"
+model.save_pretrained(final_dir)
+tok.save_pretrained(final_dir)
+with open(os.path.join(final_dir, "training_args.json"), "w") as f:
+    json.dump(args.to_dict(), f, indent=2)
+
+print(f"\n✅ LoRA fine-tune complete — adapter saved to: {final_dir}")
+
+
